@@ -1,18 +1,21 @@
 #
 # Copyright (c) 2022 Airbyte, Inc., all rights reserved.
 #
-
-
+import logging
 from abc import ABC, abstractmethod
 from functools import cached_property
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union, cast
 from urllib.parse import parse_qsl, urlparse
 
 import requests
 from airbyte_cdk import AirbyteLogger
+from airbyte_cdk.models import SyncMode
 from airbyte_cdk.sources import AbstractSource
 from airbyte_cdk.sources.streams import Stream
+from airbyte_cdk.sources.streams.availability_strategy import AvailabilityStrategy
+from airbyte_cdk.sources.streams.core import StreamData
 from airbyte_cdk.sources.streams.http import HttpStream
+from airbyte_cdk.sources.streams.http.availability_strategy import HttpAvailabilityStrategy
 
 from .auth import ShopifyAuthenticator
 from .graphql import get_query_products
@@ -163,6 +166,15 @@ class IncrementalShopifyStream(ShopifyStream, ABC):
             yield from records_slice
 
 
+class ShopifySubstreamHttpAvailabilityStrategy(HttpAvailabilityStrategy):
+
+    def check_availability(self, stream: Stream, logger: logging.Logger, source: Optional["Source"]) -> Tuple[bool, Optional[str]]:
+        return super(ShopifySubstreamHttpAvailabilityStrategy, self).check_availability(
+            ShopifySubstreamCheck(
+                cast(ShopifySubstream, stream)
+            ), logger, source)
+
+
 class ShopifySubstream(IncrementalShopifyStream):
     """
     ShopifySubstream - provides slicing functionality for streams using parts of data from parent stream.
@@ -220,7 +232,11 @@ class ShopifySubstream(IncrementalShopifyStream):
             params.update(**next_page_token)
         return params
 
-    def stream_slices(self, stream_state: Mapping[str, Any] = None, **kwargs) -> Iterable[Optional[Mapping[str, Any]]]:
+    @property
+    def availability_strategy(self) -> Optional[AvailabilityStrategy]:
+        return ShopifySubstreamHttpAvailabilityStrategy()
+
+    def stream_slices(self, stream_state: Mapping[str, Any] = None, limit=None, **kwargs) -> Iterable[Optional[Mapping[str, Any]]]:
         """
         Reading the parent stream for slices with structure:
         EXAMPLE: for given nested_record as `id` of Orders,
@@ -234,12 +250,15 @@ class ShopifySubstream(IncrementalShopifyStream):
             ]
         """
         sorted_substream_slices = []
-
         # reading parent nested stream_state from child stream state
         parent_stream_state = stream_state.get(self.parent_stream.name) if stream_state else {}
-
+        limit = limit or -1
+        counter = 0
         # reading the parent stream
         for record in self.parent_stream.read_records(stream_state=parent_stream_state, **kwargs):
+            counter += 1
+            if counter % 100 == 0:
+                self.logger.info(f'Seeking slices, iterated {counter} parent records')
             # updating the `stream_state` with the state of it's parent stream
             # to have the child stream sync independently from the parent stream
             stream_state_cache.cached_state[self.parent_stream.name] = self.parent_stream.get_updated_state({}, record)
@@ -259,6 +278,8 @@ class ShopifySubstream(IncrementalShopifyStream):
                             for sub_record in record[self.nested_record]
                         ]
                     )
+                    if len(sorted_substream_slices) == limit:
+                        break
             elif self.nested_substream:
                 if record.get(self.nested_substream):
                     sorted_substream_slices.append(
@@ -267,6 +288,8 @@ class ShopifySubstream(IncrementalShopifyStream):
                             self.cursor_field: record[self.nested_substream][0].get(self.cursor_field, self.default_state_comparison_value),
                         }
                     )
+                    if len(sorted_substream_slices) == limit:
+                        break
             else:
                 yield {self.slice_key: record[self.nested_record]}
 
@@ -279,10 +302,10 @@ class ShopifySubstream(IncrementalShopifyStream):
                     yield {self.slice_key: sorted_slice[self.slice_key]}
 
     def read_records(
-        self,
-        stream_state: Mapping[str, Any] = None,
-        stream_slice: Optional[Mapping[str, Any]] = None,
-        **kwargs,
+            self,
+            stream_state: Mapping[str, Any] = None,
+            stream_slice: Optional[Mapping[str, Any]] = None,
+            **kwargs,
     ) -> Iterable[Mapping[str, Any]]:
         """Reading child streams records for each `id`"""
 
@@ -295,6 +318,28 @@ class ShopifySubstream(IncrementalShopifyStream):
         self.logger.info(f"Reading {self.name} for {self.slice_key}: {slice_data}")
         records = super().read_records(stream_slice=stream_slice, **kwargs)
         yield from self.filter_records_newer_than_state(stream_state=stream_state, records_slice=records)
+
+
+class ShopifySubstreamCheck(Stream):
+
+    def read_records(self, sync_mode: SyncMode, cursor_field: List[str] = None, stream_slice: Mapping[str, Any] = None,
+                     stream_state: Mapping[str, Any] = None) -> Iterable[StreamData]:
+        return self._underlying.read_records(sync_mode=sync_mode, cursor_field=cursor_field, stream_slice=stream_slice, stream_state=stream_state)
+
+    @property
+    def primary_key(self) -> Optional[Union[str, List[str], List[List[str]]]]:
+        raise NotImplementedError()
+
+    def __init__(self, underlying: 'ShopifySubstream'):
+        self._underlying = underlying
+
+    def stream_slices(
+            self, *, sync_mode: SyncMode, cursor_field: List[str] = None, stream_state: Mapping[str, Any] = None
+    ) -> Iterable[Optional[Mapping[str, Any]]]:
+        return self._underlying.stream_slices(stream_state=stream_state,
+                                              sync_mode=sync_mode,
+                                              cursor_field=cursor_field,
+                                              limit=1)
 
 
 class MetafieldShopifySubstream(ShopifySubstream):
@@ -354,7 +399,7 @@ class Orders(IncrementalShopifyStream):
         return f"{self.data_field}.json"
 
     def request_params(
-        self, stream_state: Mapping[str, Any] = None, next_page_token: Mapping[str, Any] = None, **kwargs
+            self, stream_state: Mapping[str, Any] = None, next_page_token: Mapping[str, Any] = None, **kwargs
     ) -> MutableMapping[str, Any]:
         params = super().request_params(stream_state=stream_state, next_page_token=next_page_token, **kwargs)
         if not next_page_token:
@@ -395,18 +440,18 @@ class ProductsGraphQl(IncrementalShopifyStream):
         return f"{self.data_field}.json"
 
     def request_params(
-        self,
-        stream_state: Optional[Mapping[str, Any]] = None,
-        next_page_token: Optional[Mapping[str, Any]] = None,
-        **kwargs,
+            self,
+            stream_state: Optional[Mapping[str, Any]] = None,
+            next_page_token: Optional[Mapping[str, Any]] = None,
+            **kwargs,
     ) -> MutableMapping[str, Any]:
         return {}
 
     def request_body_json(
-        self,
-        stream_state: Mapping[str, Any],
-        stream_slice: Optional[Mapping[str, Any]] = None,
-        next_page_token: Optional[Mapping[str, Any]] = None,
+            self,
+            stream_state: Mapping[str, Any],
+            stream_slice: Optional[Mapping[str, Any]] = None,
+            next_page_token: Optional[Mapping[str, Any]] = None,
     ) -> Optional[Mapping]:
         state_value = stream_state.get(self.filter_field)
         if state_value:
@@ -505,7 +550,7 @@ class AbandonedCheckouts(IncrementalShopifyStream):
         return f"{self.data_field}.json"
 
     def request_params(
-        self, stream_state: Mapping[str, Any] = None, next_page_token: Mapping[str, Any] = None, **kwargs
+            self, stream_state: Mapping[str, Any] = None, next_page_token: Mapping[str, Any] = None, **kwargs
     ) -> MutableMapping[str, Any]:
         params = super().request_params(stream_state=stream_state, next_page_token=next_page_token, **kwargs)
         # If there is a next page token then we should only send pagination-related parameters.
@@ -573,7 +618,6 @@ class MetafieldCollections(MetafieldShopifySubstream):
 
 
 class BalanceTransactions(IncrementalShopifyStream):
-
     """
     PaymentsTransactions stream does not support Incremental Refresh based on datetime fields, only `since_id` is supported:
     https://shopify.dev/api/admin-rest/2021-07/resources/transactions
@@ -769,11 +813,11 @@ class SourceShopify(AbstractSource):
         user_scopes = self.get_user_scopes(config)
         always_permitted_streams = ["MetafieldShops", "Shop"]
         permitted_streams = [
-            stream
-            for user_scope in user_scopes
-            if user_scope["handle"] in SCOPES_MAPPING
-            for stream in SCOPES_MAPPING.get(user_scope["handle"])
-        ] + always_permitted_streams
+                                stream
+                                for user_scope in user_scopes
+                                if user_scope["handle"] in SCOPES_MAPPING
+                                for stream in SCOPES_MAPPING.get(user_scope["handle"])
+                            ] + always_permitted_streams
 
         # before adding stream to stream_instances list, please add it to SCOPES_MAPPING
         stream_instances = [
