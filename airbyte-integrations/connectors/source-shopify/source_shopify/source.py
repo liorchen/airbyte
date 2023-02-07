@@ -545,6 +545,10 @@ class MetafieldProductVariants(MetafieldShopifySubstream):
 
 class AbandonedCheckouts(IncrementalShopifyStream):
     data_field = "checkouts"
+    limit = 20
+
+    def state_checkpoint_interval(self) -> int:
+        return 250
 
     def path(self, **kwargs) -> str:
         return f"{self.data_field}.json"
