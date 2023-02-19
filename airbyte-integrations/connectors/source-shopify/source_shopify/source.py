@@ -1,6 +1,7 @@
 #
 # Copyright (c) 2022 Airbyte, Inc., all rights reserved.
 #
+import datetime
 import logging
 from abc import ABC, abstractmethod
 from functools import cached_property
@@ -34,7 +35,7 @@ class ShopifyStream(HttpStream, ABC):
     primary_key = "id"
     order_field = "updated_at"
     filter_field = "updated_at_min"
-
+    max_records_per_stream = 100000
     raise_on_http_errors = True
 
     def __init__(self, config: Dict):
@@ -69,6 +70,22 @@ class ShopifyStream(HttpStream, ABC):
             params["order"] = f"{self.order_field} asc"
             params[self.filter_field] = self.default_filter_field_value
         return params
+
+    def read_records(
+            self,
+            sync_mode: SyncMode,
+            cursor_field: List[str] = None,
+            stream_slice: Mapping[str, Any] = None,
+            stream_state: Mapping[str, Any] = None,
+    ) -> Iterable[StreamData]:
+        counter = 0
+        for rec in super(ShopifyStream, self).read_records(sync_mode, cursor_field, stream_slice, stream_state):
+            yield rec
+            counter += 1
+            if counter >= self.max_records_per_stream:
+                self.logger.info(f'reached maximum items per sync for the stream {self.name}.'
+                                 f'stopping to commit all to destination, next sync shell continue from this point')
+                break
 
     @limiter.balance_rate_limit()
     def parse_response(self, response: requests.Response, **kwargs) -> Iterable[Mapping]:
@@ -197,6 +214,9 @@ class ShopifySubstream(IncrementalShopifyStream):
     nested_record_field_name: str = None
     nested_substream = None
     nested_substream_list_field_id = None
+    # we limit the number of items per sync because
+    # big shopify stores are currently taking many days of sync and a could fail in between,
+    # which will cause the sync to restart and may fail again
 
     @cached_property
     def parent_stream(self) -> object:
@@ -257,7 +277,7 @@ class ShopifySubstream(IncrementalShopifyStream):
         # reading the parent stream
         for record in self.parent_stream.read_records(stream_state=parent_stream_state, **kwargs):
             counter += 1
-            if counter % 100 == 0:
+            if counter % 1000 == 0:
                 self.logger.info(f'Seeking slices, iterated {counter} parent records')
             # updating the `stream_state` with the state of it's parent stream
             # to have the child stream sync independently from the parent stream
@@ -292,7 +312,6 @@ class ShopifySubstream(IncrementalShopifyStream):
                         break
             else:
                 yield {self.slice_key: record[self.nested_record]}
-
         # output slice from sorted list to avoid filtering older records
         if self.nested_substream:
             if len(sorted_substream_slices) > 0:
@@ -324,7 +343,8 @@ class ShopifySubstreamCheck(Stream):
 
     def read_records(self, sync_mode: SyncMode, cursor_field: List[str] = None, stream_slice: Mapping[str, Any] = None,
                      stream_state: Mapping[str, Any] = None) -> Iterable[StreamData]:
-        return self._underlying.read_records(sync_mode=sync_mode, cursor_field=cursor_field, stream_slice=stream_slice, stream_state=stream_state)
+        return self._underlying.read_records(sync_mode=sync_mode, cursor_field=cursor_field, stream_slice=stream_slice,
+                                             stream_state=stream_state)
 
     @property
     def primary_key(self) -> Optional[Union[str, List[str], List[List[str]]]]:
@@ -394,6 +414,8 @@ class MetafieldCustomers(MetafieldShopifySubstream):
 
 class Orders(IncrementalShopifyStream):
     data_field = "orders"
+
+    # use_cache = True
 
     def path(self, **kwargs) -> str:
         return f"{self.data_field}.json"
@@ -544,14 +566,23 @@ class MetafieldProductVariants(MetafieldShopifySubstream):
 
 
 class AbandonedCheckouts(IncrementalShopifyStream):
+    api_version = "2022-07"
     data_field = "checkouts"
     limit = 20
 
+    @property
     def state_checkpoint_interval(self) -> int:
         return 250
 
     def path(self, **kwargs) -> str:
         return f"{self.data_field}.json"
+
+    @property
+    def default_filter_field_value(self) -> Union[int, str]:
+        # abandoned checkout queries are limited to 3 months of data
+        start_date = self.config["start_date"]
+        return str(max(datetime.date.fromisoformat(start_date),
+                       (datetime.datetime.utcnow() - datetime.timedelta(days=90)).date()))
 
     def request_params(
             self, stream_state: Mapping[str, Any] = None, next_page_token: Mapping[str, Any] = None, **kwargs
